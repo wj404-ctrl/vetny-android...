@@ -1,0 +1,105 @@
+name: Build VETNY APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Separate groups per event so a push can't cancel a manual run (and vice-versa).
+concurrency:
+  group: vetny-apk-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Download source code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Find the Android project (zip or plain repo)
+        run: |
+          # If the repo itself is the Android project, use it.
+          if [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            echo "Using the repo root as the Android project"
+            exit 0
+          fi
+
+          # Otherwise unzip every top-level zip in the repo.
+          mkdir -p extracted
+          find . -maxdepth 2 -name "*.zip" \
+            -not -path "./extracted/*" -not -path "./.git/*" -print0 \
+            | while IFS= read -r -d '' z; do
+                echo "Unzipping: $z"
+                unzip -q -o "$z" -d extracted
+              done
+
+          # Pick the shallowest settings.gradle(.kts) found.
+          F=$(find extracted \( -name settings.gradle -o -name settings.gradle.kts \) \
+                -not -path "*/__MACOSX/*" \
+                | awk -F/ '{ print NF" "$0 }' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$F" ]; then
+            echo "::error::No settings.gradle(.kts) found. Make sure the zip is an Android Studio project."
+            exit 1
+          fi
+          echo "PROJECT_DIR=$(dirname "$F")" >> "$GITHUB_ENV"
+          echo "Android project found in: $(dirname "$F")"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-34" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Write local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+        working-directory: ${{ env.PROJECT_DIR }}
+
+      # Persist the AGP-generated debug keystore so every build signs with the
+      # same key. Without this, each run generates a new keystore and users
+      # cannot install an updated APK over a previously installed one
+      # ("App not installed" / signature mismatch).
+      - name: Cache debug keystore (stable signing)
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: vetny-debug-keystore-v1
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            gradle assembleDebug --stacktrace --no-daemon
+          fi
+
+      - name: Show APK
+        run: |
+          find "$PROJECT_DIR" -path "*/build/outputs/apk/debug/*.apk" -exec ls -lh {} \;
+
+      - name: Upload VETNY APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VETNY-APK
+          path: "${{ env.PROJECT_DIR }}/**/build/outputs/apk/debug/*.apk"
+          if-no-files-found: error
+          retention-days: 14
